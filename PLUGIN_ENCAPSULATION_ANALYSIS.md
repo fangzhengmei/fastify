@@ -1081,7 +1081,813 @@ test('plugin metadata - ignore prefix', (t, testDone) => {
 - 路由注册在父实例的前缀上下文中
 - 所以如果父实例有前缀，路由会继承那个前缀
 
-## 7. 完整流程图
+## 7. Context 对象 - Scope 状态的运行时快照
+
+前面的章节分析了 Fastify 的 scope 隔离机制、装饰器传播和 hooks 传播。但这些机制最终要落地到**请求处理**上——这就是 `Context` 对象的作用。
+
+`Context` 是每个路由的**运行时上下文**，它在 `preReady` 阶段将 scope 积累的 hooks、decorators、schemas 等信息**固化**成一个独立对象，请求到来时直接从这个 Context 读取配置，不再访问 scope。
+
+### 7.1 Context 对象的结构
+
+`lib/context.js` 定义了 Context 构造函数：
+
+```javascript
+function Context ({
+  schema,
+  handler,
+  config,
+  requestIdLogLabel,
+  childLoggerFactory,
+  errorHandler,
+  bodyLimit,
+  logLevel,
+  logSerializers,
+  attachValidation,
+  validatorCompiler,
+  serializerCompiler,
+  replySerializer,
+  schemaErrorFormatter,
+  exposeHeadRoute,
+  prefixTrailingSlash,
+  server,
+  isFastify,
+  handlerTimeout
+}) {
+  // 核心属性
+  this.schema = schema
+  this.handler = handler
+  this.Reply = server[kReply]
+  this.Request = server[kRequest]
+  this.contentTypeParser = server[kContentTypeParser]
+  
+  // Hooks 链（初始为 null，preReady 阶段固化）
+  this.onRequest = null
+  this.onSend = null
+  this.onError = null
+  this.onTimeout = null
+  this.preHandler = null
+  this.onResponse = null
+  this.preSerialization = null
+  this.onRequestAbort = null
+  
+  // 配置属性
+  this.config = config
+  this.errorHandler = errorHandler || server[kErrorHandler]
+  this.requestIdLogLabel = requestIdLogLabel || server[kOptions].requestIdLogLabel
+  this.childLoggerFactory = childLoggerFactory || server[kChildLoggerFactory]
+  this.logLevel = logLevel || server[kLogLevel]
+  this.logSerializers = logSerializers
+  this.handlerTimeout = handlerTimeout || server[kHandlerTimeout] || 0
+  this.attachValidation = attachValidation
+  
+  // Schema 相关
+  this.validatorCompiler = validatorCompiler || null
+  this.serializerCompiler = serializerCompiler || null
+  this.schemaErrorFormatter = schemaErrorFormatter || server[kSchemaErrorFormatter] || defaultSchemaErrorFormatter
+  
+  // 其他
+  this.server = server
+  // ...
+}
+```
+
+**Context 对象的属性分类**：
+
+| 分类 | 属性 | 来源 | 说明 |
+|------|------|------|------|
+| **核心** | `schema`, `handler`, `config` | 路由定义 | 路由的 schema、处理函数、配置 |
+| **构造函数** | `Request`, `Reply` | `server[kRequest]`, `server[kReply]` | 当前 scope 的 Request/Reply 构造函数 |
+| **Hooks 链** | `onRequest`, `preParsing`, `preValidation`, `preHandler`, `preSerialization`, `onSend`, `onResponse`, `onError`, `onTimeout`, `onRequestAbort` | 初始为 `null`，preReady 阶段固化 | 合并后的 hooks 数组 |
+| **配置** | `logLevel`, `logSerializers`, `errorHandler`, `handlerTimeout`, `bodyLimit` | 路由定义 + 继承自 server | 日志级别、错误处理器、超时等 |
+| **Schema** | `validatorCompiler`, `serializerCompiler`, `schemaErrorFormatter` | 路由定义 + 继承自 server | 验证/序列化编译器 |
+| **引用** | `server`, `contentTypeParser` | 继承自 server | Fastify 实例引用、内容类型解析器 |
+
+**关键点**：
+- Hooks 链属性**初始为 `null`**，在 **preReady 阶段**才被赋值
+- `Request` 和 `Reply` 直接引用 `server[kRequest]` 和 `server[kReply]`（当前 scope 的构造函数）
+- `server` 是创建这个 Context 的 scope 实例的引用
+
+### 7.2 Context 的创建与固化流程
+
+Context 的创建和固化分为**三个阶段**：
+
+#### 阶段 1: 同步创建 Context（路由注册时）
+
+在 `lib/route.js:340-359` 的 `addNewRoute` 函数中：
+
+```javascript
+const context = new Context({
+  schema: opts.schema,
+  handler: opts.handler.bind(this),  // 绑定到当前 scope
+  config,
+  errorHandler: opts.errorHandler,
+  childLoggerFactory: opts.childLoggerFactory,
+  bodyLimit: opts.bodyLimit,
+  logLevel: opts.logLevel,
+  logSerializers: opts.logSerializers,
+  attachValidation: opts.attachValidation,
+  schemaErrorFormatter: opts.schemaErrorFormatter,
+  replySerializer: this[kReplySerializerDefault],
+  validatorCompiler: opts.validatorCompiler,
+  serializerCompiler: opts.serializerCompiler,
+  exposeHeadRoute: shouldExposeHead,
+  prefixTrailingSlash: (opts.prefixTrailingSlash || 'both'),
+  server: this,  // 当前 scope 实例
+  isFastify,
+  handlerTimeout: opts.handlerTimeout
+})
+
+// 立即注册到路由器
+router.on(opts.method, opts.url, { constraints }, routeHandler, context)
+```
+
+**此时的 Context 状态**：
+- `handler` 已绑定到当前 scope（`this`）
+- `Request` = `server[kRequest]`（当前 scope 的 Request 构造函数）
+- `Reply` = `server[kReply]`（当前 scope 的 Reply 构造函数）
+- **所有 hooks 属性都是 `null`**
+- 路由已注册到 `find-my-way` 路由器，Context 作为路由的用户数据
+
+#### 阶段 2: this.after 回调中补充属性
+
+`lib/route.js:380-449`：
+
+```javascript
+this.after((notHandledErr, done) => {
+  // 补充 context 的属性
+  context.errorHandler = opts.errorHandler
+    ? buildErrorHandler(this[kErrorHandler], opts.errorHandler)
+    : this[kErrorHandler]
+  context._parserOptions.limit = opts.bodyLimit || null
+  context.logLevel = opts.logLevel
+  context.logSerializers = opts.logSerializers
+  context.attachValidation = opts.attachValidation
+  context[kReplySerializerDefault] = this[kReplySerializerDefault]
+  context.schemaErrorFormatter =
+    opts.schemaErrorFormatter || this[kSchemaErrorFormatter] || context.schemaErrorFormatter
+
+  // 注册 preReady 回调（关键！）
+  avvio.once('preReady', () => {
+    // 第 3 阶段在这里执行
+  })
+
+  done(notHandledErr)
+})
+```
+
+**关键点**：
+- `this.after` 回调在**当前插件及其子插件加载完成后**执行
+- 此时注册 `avvio.once('preReady')` 回调
+
+#### 阶段 3: preReady 阶段 - 状态固化
+
+`lib/route.js:394-446` 是**最关键的阶段**：
+
+```javascript
+avvio.once('preReady', () => {
+  // ========== 操作 1: 固化 hooks 链 ==========
+  for (const hook of lifecycleHooks) {
+    const toSet = this[kHooks][hook]        // 实例级 hooks（来自 scope）
+      .concat(opts[hook] || [])             // 路由级 hooks（来自路由定义）
+      .map(h => h.bind(this))                // 绑定到当前 scope
+    context[hook] = toSet.length ? toSet : null
+  }
+
+  // ========== 操作 2: 优化 Request/Reply 构造函数 ==========
+  while (!context.Request[kHasBeenDecorated] && context.Request.parent) {
+    context.Request = context.Request.parent
+  }
+  while (!context.Reply[kHasBeenDecorated] && context.Reply.parent) {
+    context.Reply = context.Reply.parent
+  }
+
+  // ========== 操作 3: 设置 404 Context ==========
+  fourOhFour.setContext(this, context)
+
+  // ========== 操作 4: 编译 schema ==========
+  if (opts.schema) {
+    context.schema = normalizeSchema(context.schema, this.initialConfig)
+    // ... 编译验证和序列化 schema
+  }
+})
+```
+
+这是整个 Context 机制的**核心**，让我们逐一分析：
+
+### 7.3 preReady 阶段的关键操作深度分析
+
+#### 操作 1: Hooks 链的固化
+
+```javascript
+for (const hook of lifecycleHooks) {
+  const toSet = this[kHooks][hook]        // scope 积累的 hooks
+    .concat(opts[hook] || [])             // 路由定义的 hooks
+    .map(h => h.bind(this))                // 绑定到当前 scope
+  context[hook] = toSet.length ? toSet : null
+}
+```
+
+**重要发现**：
+
+1. **合并来源**：
+   - `this[kHooks][hook]`：当前 scope 积累的所有 hooks（包括从父 scope 传播来的）
+   - `opts[hook]`：路由定义时指定的路由级 hooks（如 `fastify.get('/', { preHandler: [...] }, handler)`）
+
+2. **顺序**：实例级 hooks **在前**，路由级 hooks **在后**
+   - 执行顺序：父 scope hooks → 当前 scope hooks → 路由级 hooks
+
+3. **绑定**：所有 hooks 通过 `.bind(this)` 绑定到**当前 scope**
+   - 这就是为什么在 hook 中 `this` 指向创建该路由的 scope 实例
+
+4. **固化时机**：此时 `this[kHooks]` 已经包含了所有通过 `addHook` 添加的 hooks（包括从父 scope 传播来的）
+   - 一旦固化，**后续添加的 hooks 不会影响已注册的路由**
+
+#### 操作 2: Request/Reply 构造函数的优化（关键！）
+
+这是一个**性能优化**，但对于理解装饰器的传播机制至关重要：
+
+```javascript
+while (!context.Request[kHasBeenDecorated] && context.Request.parent) {
+  context.Request = context.Request.parent
+}
+while (!context.Reply[kHasBeenDecorated] && context.Reply.parent) {
+  context.Reply = context.Reply.parent
+}
+```
+
+**背景回顾**：
+- 每个 scope 都有自己的 `kRequest` 和 `kReply`（通过 `buildRequest` 和 `buildReply` 创建）
+- 这些构造函数形成一个链表：`childRequest.parent = parentRequest`
+- `kHasBeenDecorated` 标记表示该构造函数是否有自己的装饰器
+
+**优化逻辑**：
+- 如果当前 scope 的 `Request` 构造函数**没有被装饰**（`kHasBeenDecorated` 为 false）
+- 并且存在父构造函数（`parent`）
+- 则**直接使用父构造函数**，跳过当前层级
+
+**目的**：
+- 避免运行时每次创建 Request/Reply 实例时都要遍历原型链
+- 如果没有自定义装饰器，直接使用最近被装饰过的祖先的构造函数
+
+**实际效果**：
+- 路由注册在子 scope，但 Context 中的 `Request`/`Reply` **可能是父 scope 的构造函数**
+- 这确保了即使路由在深层嵌套的 scope 中，也能**正确访问所有祖先的装饰器**
+
+**示例**：
+```javascript
+const fastify = Fastify()
+
+// Root scope - 添加装饰器
+fastify.decorateRequest('rootProp', 'root value')
+// 此时 fastify[kRequest][kHasBeenDecorated] = true
+
+fastify.register(function childScope (instance, opts, done) {
+  // 子 scope 的 Request 构造函数：
+  // - kHasBeenDecorated = false（没有新装饰器）
+  // - parent = fastify[kRequest]
+  
+  instance.get('/test', (req, reply) => {
+    // 路由注册在 childScope
+    // 但 Context.Request 会被优化为 fastify[kRequest]
+    // 因为 childScope 的 Request 没有被装饰
+    console.log(req.rootProp)  // 'root value' - 可以访问！
+    reply.send({ ok: true })
+  })
+  
+  done()
+})
+```
+
+**这解释了为什么装饰器能在子 scope 中工作**：
+- Context 中的 `Request`/`Reply` 是**已优化的版本**
+- 它们指向**最近被装饰过的祖先的构造函数**
+- 运行时创建的 Request/Reply 实例直接包含所有必要的装饰器
+
+#### 操作 3: 设置 404 Context
+
+```javascript
+fourOhFour.setContext(this, context)
+```
+
+这确保了 404 路由也能使用正确的 scope 配置（hooks、logLevel 等）。
+
+#### 操作 4: 编译 Schema
+
+```javascript
+if (opts.schema) {
+  context.schema = normalizeSchema(context.schema, this.initialConfig)
+  
+  // 编译验证 schema
+  compileSchemasForValidation(
+    context,
+    opts.validatorCompiler || schemaController.validatorCompiler,
+    isCustom
+  )
+  
+  // 编译序列化 schema
+  compileSchemasForSerialization(
+    context,
+    opts.serializerCompiler || schemaController.serializerCompiler
+  )
+}
+```
+
+Schema 编译也是在 preReady 阶段完成的，编译结果存储在 Context 的 Symbol 属性中：
+- `kRequestCacheValidateFns`：缓存的验证函数
+- `kReplyCacheSerializeFns`：缓存的序列化函数
+
+### 7.4 Context 与 Scope 的关系总结
+
+| 维度 | Scope | Context |
+|------|-------|---------|
+| **创建时机** | `fastify.register()` 时（`override` 函数） | 路由注册时（`addNewRoute`） |
+| **生命周期** | 从注册到服务器关闭 | 从 preReady 固化到路由被移除 |
+| **可变性** | 可变（可以继续 `addHook`、`decorate`） | **不可变**（preReady 后固化） |
+| **作用范围** | 整个插件及其子插件 | **单个路由** |
+| **运行时访问** | 不直接访问 | **请求处理时直接读取** |
+
+**关键关系**：
+- **Context 是 Scope 状态的快照**，在 preReady 阶段冻结
+- **一个 Scope 可以有多个 Context**（每个路由一个）
+- **Context 绑定到创建它的 Scope**（`context.server = this`）
+- 但 Context 的 `Request`/`Reply`/`hooks` 可能包含来自**祖先 Scope** 的内容（通过传播机制）
+
+### 7.5 运行时请求如何通过 Context 访问 Hooks 链
+
+现在让我们看看请求到来时，Context 是如何被使用的。
+
+#### 路由匹配阶段
+
+`find-my-way` 路由器匹配 URL 后，返回对应的 Context：
+
+```javascript
+// 路由注册时：
+router.on(opts.method, opts.url, { constraints }, routeHandler, context)
+
+// 请求到来时，find-my-way 调用：
+routeHandler(req, res, params, context, query)
+```
+
+#### routeHandler 执行（`lib/route.js:462-589`）
+
+```javascript
+function routeHandler (req, res, params, context, query) {
+  // 1. 生成请求 ID
+  const id = getGenReqId(context.server, req)
+
+  // 2. 从 Context 创建 logger（使用 context.logLevel, context.logSerializers）
+  const loggerOpts = {
+    level: context.logLevel
+  }
+  if (context.logSerializers) {
+    loggerOpts.serializers = context.logSerializers
+  }
+  const childLogger = createChildLogger(context, logger, req, id, loggerOpts)
+
+  // 3. 从 Context 创建 Request 和 Reply 实例！
+  // 注意：使用的是 context.Request 和 context.Reply（已优化的构造函数）
+  const request = new context.Request(id, params, req, query, childLogger, context)
+  const reply = new context.Reply(res, request, childLogger)
+
+  // 4. 设置 handler 超时（使用 context.handlerTimeout）
+  const handlerTimeout = context.handlerTimeout
+  if (handlerTimeout > 0) {
+    // ... 设置超时
+  }
+
+  // 5. 执行 onRequest hooks（从 context.onRequest 读取！）
+  if (context.onRequest !== null) {
+    onRequestHookRunner(
+      context.onRequest,    // <-- 直接从 Context 读取
+      request,
+      reply,
+      runPreParsing        // 下一个阶段的回调
+    )
+  } else {
+    runPreParsing(null, request, reply)
+  }
+
+  // 6. 注册其他 hooks 的监听器
+  if (context.onRequestAbort !== null) { /* ... */ }
+  if (context.onTimeout !== null) { /* ... */ }
+}
+```
+
+**关键点**：
+- **所有配置都从 Context 读取**：`logLevel`、`logSerializers`、`handlerTimeout`、`onRequest` 等
+- **Request/Reply 使用 Context 中的构造函数**：`new context.Request(...)`、`new context.Reply(...)`
+- **Hooks 直接从 Context 读取**：`context.onRequest`，不再访问 `server[kHooks]`
+
+#### Hooks 链执行流程
+
+从 `lib/route.js` 和 `lib/handle-request.js` 可以看到完整的执行顺序：
+
+```
+请求到达 → find-my-way 匹配 → routeHandler(context, ...)
+                                              │
+                                              ▼
+                    ┌─────────────────────────────────────────┐
+                    │  1. context.onRequest (onRequestHookRunner) │
+                    └───────────────────┬─────────────────────┘
+                                        │
+                                        ▼
+                    ┌─────────────────────────────────────────┐
+                    │  2. context.preParsing (preParsingHookRunner) │
+                    └───────────────────┬─────────────────────┘
+                                        │
+                                        ▼
+                    ┌─────────────────────────────────────────┐
+                    │  3. 解析请求体 (handleRequest)          │
+                    └───────────────────┬─────────────────────┘
+                                        │
+                                        ▼
+                    ┌─────────────────────────────────────────┐
+                    │  4. context.preValidation (preValidationHookRunner) │
+                    └───────────────────┬─────────────────────┘
+                                        │
+                                        ▼
+                    ┌─────────────────────────────────────────┐
+                    │  5. Schema 验证 (validateSchema)       │
+                    │     使用 context.validatorCompiler      │
+                    └───────────────────┬─────────────────────┘
+                                        │
+                                        ▼
+                    ┌─────────────────────────────────────────┐
+                    │  6. context.preHandler (preHandlerHookRunner) │
+                    └───────────────────┬─────────────────────┘
+                                        │
+                                        ▼
+                    ┌─────────────────────────────────────────┐
+                    │  7. context.handler (路由处理函数)      │
+                    └───────────────────┬─────────────────────┘
+                                        │
+                                        ▼
+                    ┌─────────────────────────────────────────┐
+                    │  8. context.preSerialization          │
+                    │     (preSerializationHookRunner)        │
+                    └───────────────────┬─────────────────────┘
+                                        │
+                                        ▼
+                    ┌─────────────────────────────────────────┐
+                    │  9. 序列化响应                          │
+                    │     使用 context.serializerCompiler     │
+                    └───────────────────┬─────────────────────┘
+                                        │
+                                        ▼
+                    ┌─────────────────────────────────────────┐
+                    │  10. context.onSend (onSendHookRunner) │
+                    └───────────────────┬─────────────────────┘
+                                        │
+                                        ▼
+                    ┌─────────────────────────────────────────┐
+                    │  11. 发送响应 (reply.send)              │
+                    └───────────────────┬─────────────────────┘
+                                        │
+                                        ▼
+                    ┌─────────────────────────────────────────┐
+                    │  12. context.onResponse (onResponseHookRunner) │
+                    └─────────────────────────────────────────┘
+```
+
+#### 错误处理
+
+如果在任何阶段发生错误：
+
+```javascript
+// 1. 标记错误
+reply[kReplyIsError] = true
+
+// 2. 发送错误（触发 context.onError hooks）
+reply.send(err)
+
+// 3. errorHandler 处理（使用 context.errorHandler）
+const context = reply[kRouteContext]
+// errorHandler 从 context.errorHandler 读取
+```
+
+### 7.6 Request/Reply 与 Context 的双向绑定
+
+让我们看看 Request 和 Reply 实例如何访问 Context：
+
+**Request 构造函数**（`lib/request.js`）：
+```javascript
+function _Request (id, params, req, query, log, context) {
+  this.id = id
+  this[kRouteContext] = context  // <-- 存储 Context 引用
+  this.params = params
+  // ...
+}
+```
+
+**Reply 的 kRouteContext getter**（`lib/reply.js:80-84`）：
+```javascript
+[kRouteContext]: {
+  get () {
+    return this.request[kRouteContext]  // 代理到 Request 的 Context
+  }
+}
+```
+
+**双向关系**：
+```
+┌─────────────────┐          ┌─────────────────┐
+│    Request      │          │     Reply       │
+├─────────────────┤          ├─────────────────┤
+│ [kRouteContext] │─────────▶│    Context      │
+│      context    │          └─────────────────┘
+└─────────────────┘                   ▲
+                                        │
+                                        │
+                              ┌─────────┴─────────┐
+                              │  reply[kRouteContext]│
+                              │    getter 代理      │
+                              └─────────────────────┘
+```
+
+**实际使用**：
+```javascript
+// 在 handler 或 hook 中：
+fastify.get('/', (req, reply) => {
+  // req.routeContext 就是 Context 对象
+  console.log(req.routeContext.config)    // 路由配置
+  console.log(req.routeContext.logLevel)  // 日志级别
+  console.log(req.routeContext.server)    // Fastify 实例
+  
+  // reply.routeContext 也可以访问（代理到 req.routeContext）
+  console.log(reply.routeContext === req.routeContext)  // true
+})
+```
+
+### 7.7 fastify-plugin 如何影响 Context
+
+现在让我们理解 `fastify-plugin`（skip-override）如何影响 Context 的创建和固化。
+
+#### 场景对比
+
+```javascript
+const fastify = Fastify()
+const fp = require('fastify-plugin')
+
+// ========== 场景 A: 普通插件 ==========
+fastify.register(function normalPlugin (instance, opts, done) {
+  // 1. override 函数创建了新的封装实例 instance
+  // 2. instance.kHooks 是独立的（通过 buildHooks 复制父 hooks）
+  
+  instance.addHook('onRequest', (req, reply, done) => {
+    console.log('normalPlugin onRequest')
+    done()
+  })
+  
+  instance.get('/normal', (req, reply) => {
+    // 这个路由的 Context:
+    // - server = instance（子 scope）
+    // - onRequest = [父 hooks..., 'normalPlugin onRequest']
+    // - Request = 已优化的构造函数
+    reply.send({ from: 'normal' })
+  })
+  
+  done()
+})
+
+// ========== 场景 B: fastify-plugin ==========
+fastify.register(fp(function sharedPlugin (instance, opts, done) {
+  // 1. override 函数直接返回 old（fastify 实例）
+  // 2. instance === fastify
+  
+  instance.addHook('onRequest', (req, reply, done) => {
+    console.log('sharedPlugin onRequest')
+    done()
+  })
+  
+  instance.get('/shared', (req, reply) => {
+    // 这个路由的 Context:
+    // - server = fastify（根实例）
+    // - onRequest = [fastify 的 hooks..., 'sharedPlugin onRequest']
+    // - Request = fastify 的 Request 构造函数
+    reply.send({ from: 'shared' })
+  })
+  
+  done()
+}))
+```
+
+#### 关键差异
+
+| 维度 | 普通插件 | fastify-plugin |
+|------|----------|----------------|
+| **Context.server** | 新创建的子 scope 实例 | 父 scope 实例（可能是 fastify） |
+| **Context 中的 hooks** | 子 scope 的 `kHooks`（包含从父复制的 + 自己添加的） | 父 scope 的 `kHooks`（包含所有祖先的） |
+| **对其他路由的影响** | 只影响当前插件内注册的路由 | 影响父 scope 及其所有子 scope 中**后续注册**的路由 |
+
+#### 为什么 fastify-plugin 的 hooks 会影响"后续注册"的路由？
+
+因为：
+
+1. **Hooks 固化发生在 preReady 阶段**，而不是路由注册时
+2. **preReady 是在所有插件注册完成后**才触发的
+3. 即使路由在插件之前注册，只要在 **preReady 之前**，fastify-plugin 添加的 hooks 都会被包含
+
+**时间线示例**：
+```
+时间点 1: fastify.get('/early', handler)
+         - Context 创建，hooks 还是 null
+         - 注册 avvio.once('preReady') 回调
+
+时间点 2: fastify.register(fp(function (instance, done) {
+           instance.addHook('onRequest', myHook)
+           done()
+         }))
+         - 直接在 fastify 上执行
+         - fastify[kHooks].onRequest.push(myHook)
+
+时间点 3: avvio 触发 preReady 事件
+         - /early 路由的 preReady 回调执行
+         - context.onRequest = this[kHooks].onRequest  // 包含 myHook！
+         - 即使路由在 fp 插件之前注册！
+```
+
+**这就是为什么 `test/404s.test.js` 中的测试能通过**：
+```javascript
+test('run non-encapsulated plugin hooks on default 404', (t, done) => {
+  const fastify = Fastify()
+
+  // 先注册路由
+  fastify.get('/', function (req, reply) {
+    reply.send({ hello: 'world' })
+  })
+
+  // 后注册 fp 插件
+  fastify.register(fp(function (instance, options, done) {
+    instance.addHook('onRequest', function (req, res, done) {
+      t.assert.ok(true, 'onRequest called')  // 会在 404 时触发！
+      done()
+    })
+    done()
+  }))
+
+  // preReady 时，所有路由（包括 404）的 Context 都会包含这个 hook
+})
+```
+
+### 7.8 为什么 preReady 之后 addHook 不影响已注册的路由？
+
+因为：
+
+1. **已注册路由的 Context 的 `context[hook]` 已经固化**
+2. 虽然新的 hook 会通过 `_addHook` 传播到子 scope 的 `kHooks`
+3. 但**已固化的 Context 不会被更新**
+4. 只有**之后注册**的路由会在它们的 preReady 阶段包含新的 hook
+
+**示例**：
+```javascript
+const fastify = Fastify()
+
+// 先注册路由
+fastify.get('/first', (req, reply) => {
+  reply.send({ route: 'first' })
+})
+
+// 等待 preReady 后再添加 hook
+fastify.ready(() => {
+  // 此时 /first 的 Context.onRequest 已经固化为 null 或初始值
+  
+  // 添加新 hook
+  fastify.addHook('onRequest', (req, reply, done) => {
+    console.log('late hook')  // 不会在 /first 路由触发！
+    done()
+  })
+  
+  // 注册新路由
+  fastify.get('/second', (req, reply) => {
+    reply.send({ route: 'second' })
+  })
+  
+  // /second 的 Context 会在它自己的 preReady 阶段包含这个 hook
+  // 但 /first 不会！
+})
+```
+
+### 7.9 Context 完整流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    Context 生命周期完整流程图                                        │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  阶段 1: 路由注册时                                                                  │
+│  ─────────────────                                                                    │
+│                                                                                      │
+│  fastify.get('/path', { preHandler: [routeHook] }, handler)                        │
+│       │                                                                              │
+│       ▼                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  addNewRoute()                                                                │   │
+│  │                                                                               │   │
+│  │  1. 创建 Context:                                                             │   │
+│  │     context = new Context({                                                  │   │
+│  │       schema: opts.schema,                                                   │   │
+│  │       handler: opts.handler.bind(this),  // 绑定到当前 scope                │   │
+│  │       server: this,                        // 当前 scope 实例                │   │
+│  │       Request: this[kRequest],             // 当前 scope 的 Request          │   │
+│  │       Reply: this[kReply],                 // 当前 scope 的 Reply            │   │
+│  │       onRequest: null,                      // 初始为 null                   │   │
+│  │       preHandler: null,                     // 初始为 null                   │   │
+│  │       ...                                                                     │   │
+│  │     })                                                                        │   │
+│  │                                                                               │   │
+│  │  2. 注册到路由器:                                                             │   │
+│  │     router.on(method, url, constraints, routeHandler, context)             │   │
+│  │                                                                               │   │
+│  │  3. 注册 this.after 回调:                                                     │   │
+│  │     this.after(() => {                                                       │   │
+│  │       // 补充 context 属性                                                    │   │
+│  │       avvio.once('preReady', () => { /* 固化阶段 */ })                      │   │
+│  │     })                                                                        │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                      │
+│  阶段 2: 所有插件注册完成后                                                          │
+│  ─────────────────────────                                                          │
+│                                                                                      │
+│  avvio 触发 'preReady' 事件                                                          │
+│       │                                                                              │
+│       ▼                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  preReady 阶段（状态固化）                                                    │   │
+│  │                                                                               │   │
+│  │  对每个已注册路由，执行其 preReady 回调:                                      │   │
+│  │                                                                               │   │
+│  │  1. 固化 hooks 链:                                                            │   │
+│  │     for (const hook of lifecycleHooks) {                                     │   │
+│  │       toSet = this[kHooks][hook]           // scope 的 hooks（继承+传播）   │   │
+│  │               .concat(opts[hook] || [])    // 路由级 hooks                  │   │
+│  │               .map(h => h.bind(this))       // 绑定到当前 scope             │   │
+│  │       context[hook] = toSet.length ? toSet : null                           │   │
+│  │     }                                                                         │   │
+│  │                                                                               │   │
+│  │  2. 优化 Request/Reply 构造函数:                                             │   │
+│  │     while (!context.Request[kHasBeenDecorated] && context.Request.parent) { │   │
+│  │       context.Request = context.Request.parent  // 使用父构造函数           │   │
+│  │     }                                                                         │   │
+│  │     // 同理优化 Reply                                                         │   │
+│  │                                                                               │   │
+│  │  3. 设置 404 Context:                                                        │   │
+│  │     fourOhFour.setContext(this, context)                                     │   │
+│  │                                                                               │   │
+│  │  4. 编译 Schema:                                                              │   │
+│  │     if (opts.schema) {                                                        │   │
+│  │       compileSchemasForValidation(context, ...)                              │   │
+│  │       compileSchemasForSerialization(context, ...)                           │   │
+│  │     }                                                                         │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                      │
+│  此时 Context 已完全固化，不再变化！                                                  │
+│                                                                                      │
+│  阶段 3: 运行时请求处理                                                              │
+│  ───────────────────────                                                             │
+│                                                                                      │
+│  请求到达: GET /path                                                                  │
+│       │                                                                              │
+│       ▼                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  find-my-way 路由匹配                                                        │   │
+│  │  找到对应的 routeHandler 和 context                                          │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│       │                                                                              │
+│       ▼                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  routeHandler(req, res, params, context, query)                             │   │
+│  │                                                                               │   │
+│  │  1. 从 Context 创建 logger:                                                   │   │
+│  │     loggerOpts = { level: context.logLevel, serializers: context.logSerializers }│
+│  │                                                                               │   │
+│  │  2. 从 Context 创建 Request/Reply:                                            │   │
+│  │     request = new context.Request(id, params, req, query, logger, context) │   │
+│  │     // request[kRouteContext] = context                                      │   │
+│  │                                                                               │   │
+│  │     reply = new context.Reply(res, request, logger)                          │   │
+│  │     // reply[kRouteContext] getter → request[kRouteContext]                 │   │
+│  │                                                                               │   │
+│  │  3. 执行 hooks 链（全部从 Context 读取！）:                                   │   │
+│  │                                                                               │   │
+│  │     if (context.onRequest !== null) {                                        │   │
+│  │       onRequestHookRunner(context.onRequest, request, reply, runPreParsing) │   │
+│  │     }                                                                         │   │
+│  │     // 后续: preParsing → preValidation → preHandler → handler              │   │
+│  │     //      → preSerialization → onSend → onResponse                        │   │
+│  │     // 全部使用 context[hook]                                                 │   │
+│  │                                                                               │   │
+│  │  4. 错误处理:                                                                 │   │
+│  │     // 使用 context.errorHandler                                              │   │
+│  │     // 执行 context.onError hooks                                            │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                      │
+│  整个过程中，不再访问 scope 的 kHooks、kRequest、kReply 等！                         │
+│  所有配置都从 Context 读取！                                                          │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 8. 完整流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
