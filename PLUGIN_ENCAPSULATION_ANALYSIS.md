@@ -1296,7 +1296,311 @@ test('setSchemaController: Inherits correctly parent schemas with a customized v
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.3 路由前缀隔离
+### 6.3 Content-Type Parser 隔离
+
+Fastify 通过 `kContentTypeParser` Symbol 管理每个 scope 的 body parser，这是请求处理流程中的关键组件——它负责将 HTTP 请求的 body 解析为 `request.body` 对象。
+
+#### 6.3.1 ContentTypeParser 的完整结构
+
+`lib/content-type-parser.js:33-42` 中的 `ContentTypeParser` 构造函数：
+
+```javascript
+function ContentTypeParser (bodyLimit, onProtoPoisoning, onConstructorPoisoning) {
+  this[kDefaultJsonParse] = getDefaultJsonParser(onProtoPoisoning, onConstructorPoisoning)
+  // 使用 Map 而不是普通对象，避免原型劫持攻击
+  this.customParsers = new Map()
+  // 默认注册的 parsers
+  this.customParsers.set('application/json', new Parser(true, false, bodyLimit, this[kDefaultJsonParse]))
+  this.customParsers.set('text/plain', new Parser(true, false, bodyLimit, defaultPlainTextParser))
+  // 字符串类型的 parser 列表（用于精确匹配）
+  this.parserList = ['application/json', 'text/plain']
+  // 正则表达式类型的 parser 列表
+  this.parserRegExpList = []
+  // 缓存，提高查找效率
+  this.cache = new Fifo(100)
+}
+```
+
+**核心属性**：
+
+| 属性 | 类型 | 作用 |
+|------|------|------|
+| `customParsers` | `Map` | content-type → `Parser` 实例的映射 |
+| `parserList` | `Array` | 字符串类型的 parser 列表（精确匹配） |
+| `parserRegExpList` | `Array` | 正则表达式类型的 parser 列表 |
+| `cache` | `Fifo` | 100 条容量的 FIFO 缓存，提高查找效率 |
+| `kDefaultJsonParse` | `Function` | 默认的 JSON 解析器（安全配置） |
+
+**Parser 类的结构** (`lib/content-type-parser.js:328-333`)：
+```javascript
+function Parser (asString, asBuffer, bodyLimit, fn) {
+  this.asString = asString    // 是否以字符串形式读取 body
+  this.asBuffer = asBuffer    // 是否以 Buffer 形式读取 body
+  this.bodyLimit = bodyLimit  // body 大小限制
+  this.fn = fn                // 解析函数
+}
+```
+
+#### 6.3.2 隔离与继承机制
+
+与 `kHooks`、`kRequest`、`kSchemaController` 类似，`kContentTypeParser` 在创建新的封装实例时会被**复制**，实现隔离。
+
+**源码证据** (`lib/plugin-override.js:46`)：
+```javascript
+instance[kContentTypeParser] = ContentTypeParser.helpers.buildContentTypeParser(instance[kContentTypeParser])
+```
+
+**`buildContentTypeParser` 函数** (`lib/content-type-parser.js:335-342`)：
+```javascript
+function buildContentTypeParser (c) {
+  const contentTypeParser = new ContentTypeParser()
+  contentTypeParser[kDefaultJsonParse] = c[kDefaultJsonParse]
+  // 复制 customParsers（通过 Map 构造函数复制 entries）
+  contentTypeParser.customParsers = new Map(c.customParsers.entries())
+  // 复制 parserList（通过 slice()）
+  contentTypeParser.parserList = c.parserList.slice()
+  // 复制 parserRegExpList（通过 slice()）
+  contentTypeParser.parserRegExpList = c.parserRegExpList.slice()
+  return contentTypeParser
+}
+```
+
+**关键机制**：
+1. **创建新的 ContentTypeParser 实例**：子 scope 有自己独立的 `kContentTypeParser`
+2. **复制 customParsers**：通过 `new Map(c.customParsers.entries())` 复制父 scope 的所有 parser
+3. **复制 parserList**：通过 `slice()` 复制字符串类型的 parser 列表
+4. **复制 parserRegExpList**：通过 `slice()` 复制正则表达式类型的 parser 列表
+
+**这意味着**：
+- 子 scope **继承**父 scope 已注册的所有 parser
+- 子 scope 通过 `addContentTypeParser` 添加的新 parser **只在自己的 scope 内可见**
+- 父 scope 无法看到子 scope 新增的 parser
+
+**示例**：
+```javascript
+const fastify = Fastify()
+
+// Root scope 注册自定义 parser
+fastify.addContentTypeParser('application/xml', { parseAs: 'text' }, function (req, body, done) {
+  // XML 解析逻辑
+  done(null, { xml: body })
+})
+
+fastify.register(function childPlugin (instance, opts, done) {
+  // 子 scope 继承了父 scope 的 parser
+  // 可以使用 'application/xml' parser
+  
+  // 添加新的 parser（只在子 scope 可见）
+  instance.addContentTypeParser('application/vnd.custom', { parseAs: 'buffer' }, function (req, body, done) {
+    done(null, { custom: body })
+  })
+  
+  console.log(instance.hasContentTypeParser('application/xml'))     // true（继承）
+  console.log(instance.hasContentTypeParser('application/vnd.custom')) // true（新增）
+  
+  done()
+})
+
+fastify.ready(() => {
+  console.log(fastify.hasContentTypeParser('application/xml'))        // true
+  console.log(fastify.hasContentTypeParser('application/vnd.custom')) // false（隔离）
+})
+```
+
+#### 6.3.3 运行时如何使用 ContentTypeParser
+
+**Context 中的引用** (`lib/context.js:48`)：
+```javascript
+this.contentTypeParser = server[kContentTypeParser]
+```
+
+Context 直接引用创建它的 scope 的 `kContentTypeParser`。这意味着：
+- 路由的 Context 使用创建该路由的 scope 的 parser
+- 子 scope 的路由使用子 scope 的 parser（继承了父的 + 自己新增的）
+- 父 scope 的路由使用父 scope 的 parser（看不到子 scope 新增的）
+
+**请求处理流程中的使用** (`lib/handle-request.js:51, 63`)：
+```javascript
+// 1. 如果没有 Content-Type 头部，使用空字符串查找
+request[kRouteContext].contentTypeParser.run('', handler, request, reply)
+
+// 2. 有 Content-Type 头部时，使用解析后的 mediaType
+request[kRouteContext].contentTypeParser.run(request[kRequestContentType].toString(), handler, request, reply)
+```
+
+**`ContentTypeParser.prototype.run` 函数** (`lib/content-type-parser.js:185-231`)：
+```javascript
+ContentTypeParser.prototype.run = function (contentType, handler, request, reply) {
+  // 1. 查找 parser（精确匹配 → mediaType 匹配 → 正则匹配 → 通配符）
+  const parser = this.getParser(contentType)
+
+  if (parser === undefined) {
+    if (request.is404 === true) {
+      handler(request, reply)  // 404 路由不强制要求 parser
+      return
+    }
+    // 返回 415 Unsupported Media Type
+    reply[kReplyIsError] = true
+    reply.send(new FST_ERR_CTP_INVALID_MEDIA_TYPE())
+    return
+  }
+
+  // 2. 执行 parser
+  if (parser.asString === true || parser.asBuffer === true) {
+    // 先读取原始 body，再调用 parser.fn
+    rawBody(request, reply, reply[kRouteContext]._parserOptions, parser, done)
+    return
+  }
+
+  // 直接调用 parser.fn（流模式）
+  const result = parser.fn(request, request[kRequestPayloadStream], done)
+  if (result && typeof result.then === 'function') {
+    result.then(body => { done(null, body) }, done)
+  }
+}
+```
+
+#### 6.3.4 skip-override 对 ContentTypeParser 的影响
+
+| 场景 | 普通插件 | fastify-plugin |
+|------|----------|----------------|
+| **kContentTypeParser** | 新创建的 `ContentTypeParser` 实例 | 共享父 scope 的 `ContentTypeParser` |
+| **buildContentTypeParser** | ✅ 调用，复制父 parsers | ❌ 不调用 |
+| **addContentTypeParser 影响** | 只在子 scope 可见 | 对父 scope 也可见 |
+| **路由使用的 parser** | 子 scope 的 parser（继承+新增） | 父 scope 的 parser |
+
+**源码证据**：
+- 普通插件：`override` 函数调用 `buildContentTypeParser` 创建新实例
+- fastify-plugin：`override` 函数直接返回 `old`，**不调用 `buildContentTypeParser`**
+
+**实际效果**：
+```javascript
+const fastify = Fastify()
+const fp = require('fastify-plugin')
+
+// ========== 场景 A: 普通插件 ==========
+fastify.register(function normalPlugin (instance, opts, done) {
+  // 1. override 函数调用 buildContentTypeParser
+  // 2. instance[kContentTypeParser] 是新创建的实例
+  // 3. 复制了 fastify[kContentTypeParser] 的所有 parser
+  
+  instance.addContentTypeParser('application/normal', { parseAs: 'text' }, (req, body, done) => {
+    done(null, { type: 'normal', data: body })
+  })
+  
+  // 这个 parser 只在 normalPlugin 内可见
+  // fastify.hasContentTypeParser('application/normal') === false
+  
+  done()
+})
+
+// ========== 场景 B: fastify-plugin ==========
+fastify.register(fp(function sharedPlugin (instance, opts, done) {
+  // 1. override 函数直接返回 old（fastify 实例）
+  // 2. instance === fastify
+  // 3. instance[kContentTypeParser] === fastify[kContentTypeParser]
+  
+  instance.addContentTypeParser('application/shared', { parseAs: 'text' }, (req, body, done) => {
+    done(null, { type: 'shared', data: body })
+  })
+  
+  // 这个 parser 在所有 scope 可见
+  // fastify.hasContentTypeParser('application/shared') === true
+  
+  done()
+}))
+```
+
+#### 6.3.5 addContentTypeParser API
+
+**添加 parser** (`lib/content-type-parser.js:344-364`)：
+```javascript
+function addContentTypeParser (contentType, opts, parser) {
+  if (this[kState].started) {
+    throw new FST_ERR_CTP_INSTANCE_ALREADY_STARTED('addContentTypeParser')
+  }
+  // ... 参数处理
+  if (Array.isArray(contentType)) {
+    contentType.forEach((type) => this[kContentTypeParser].add(type, opts, parser))
+  } else {
+    this[kContentTypeParser].add(contentType, opts, parser)
+  }
+  return this
+}
+```
+
+**注意**：`addContentTypeParser` 只能在服务器启动前调用（`kState.started` 为 false）。
+
+**其他 API**：
+- `hasContentTypeParser(contentType)`：检查是否存在
+- `removeContentTypeParser(contentType)`：移除
+- `removeAllContentTypeParsers()`：移除所有
+
+#### 6.3.6 ContentTypeParser 完整流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              ContentTypeParser 在 Scope 树中的隔离与继承                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  插件注册时（override 函数）：                                               │
+│  ─────────────────────────────                                               │
+│                                                                              │
+│  检查 skip-override:                                                         │
+│  ┌─────────────────┐                     ┌─────────────────┐               │
+│  │ skip-override   │                     │ skip-override   │               │
+│  │ === false       │                     │ === true        │               │
+│  └────────┬────────┘                     └────────┬────────┘               │
+│           │                                        │                        │
+│           ▼                                        ▼                        │
+│  ┌─────────────────────────────┐      ┌─────────────────────────────┐    │
+│  │ 调用 buildContentTypeParser │      │ 直接使用父的                │    │
+│  │                             │      │ kContentTypeParser          │    │
+│  │ 创建新的 ContentTypeParser   │      │                             │    │
+│  │ 实例：                        │      │ addContentTypeParser 直接  │    │
+│  │                             │      │ 在父实例上执行              │    │
+│  │ customParsers = new Map(    │      │ 所有子 scope 都能看到       │    │
+│  │   parent.customParsers.entries())│      │ 新增的 parser              │    │
+│  │ parserList = parent.parserList.slice()│      │                             │    │
+│  │ parserRegExpList = parent.parserRegExpList.slice()│      │                             │    │
+│  │                             │      │                             │    │
+│  │ 新增的 parser 只在           │      │                             │    │
+│  │ 当前 scope 可见              │      │                             │    │
+│  └─────────────────────────────┘      └─────────────────────────────┘    │
+│                                                                              │
+│  Context 中的使用：                                                          │
+│  ───────────────────                                                         │
+│                                                                              │
+│  Context 构造函数中：                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ this.contentTypeParser = server[kContentTypeParser]                  │  │
+│  │                                                                       │  │
+│  │ 路由的 Context 使用创建该路由的 scope 的 parser：                      │  │
+│  │ - 子 scope 路由：使用子 scope 的 parser（继承父的 + 自己新增的）      │  │
+│  │ - 父 scope 路由：使用父 scope 的 parser（看不到子 scope 新增的）      │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  运行时请求处理（preParsing 阶段）：                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ contentTypeParser.run(contentType, handler, request, reply)        │  │
+│  │                                                                       │  │
+│  │ 1. getParser(contentType) 查找 parser：                              │  │
+│  │    - 精确匹配（带 parameters）                                        │  │
+│  │    - 精确匹配（mediaType 只）                                         │  │
+│  │    - 正则表达式匹配                                                   │  │
+│  │    - 通配符 ''（* 注册）                                              │  │
+│  │                                                                       │  │
+│  │ 2. 执行 parser：                                                       │  │
+│  │    - asString/asBuffer: 先读取 body，再调用 parser.fn                │  │
+│  │    - 流模式: 直接调用 parser.fn(request, stream, done)               │  │
+│  │                                                                       │  │
+│  │ 3. 结果赋值给 request.body                                             │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.4 路由前缀隔离
 
 `lib/plugin-override.js:76-90` 中的 `buildRoutePrefix`：
 
@@ -1645,30 +1949,361 @@ fourOhFour.setContext(this, context)
 
 这确保了 404 路由也能使用正确的 scope 配置（hooks、logLevel 等）。
 
-#### 操作 4: 编译 Schema
+#### 操作 4: 编译 Schema（核心！）
+
+这是 schema 从 scope 的 `SchemaController` 固化到 Context 的关键步骤。让我们深入分析完整流程。
+
+##### 4.1 编译前的准备：normalizeSchema
+
+首先，路由定义的 schema 会被规范化：
 
 ```javascript
-if (opts.schema) {
-  context.schema = normalizeSchema(context.schema, this.initialConfig)
-  
-  // 编译验证 schema
-  compileSchemasForValidation(
-    context,
-    opts.validatorCompiler || schemaController.validatorCompiler,
-    isCustom
-  )
-  
-  // 编译序列化 schema
-  compileSchemasForSerialization(
-    context,
-    opts.serializerCompiler || schemaController.serializerCompiler
-  )
+context.schema = normalizeSchema(context.schema, this.initialConfig)
+```
+
+`normalizeSchema` (`lib/schemas.js:58-115`) 的主要工作：
+1. **标记 `kSchemaVisited`**：防止重复处理
+2. **alias `query` to `querystring`**：兼容两种写法
+3. **处理 Fluent Schema**：`schema.valueOf()` 转换为普通对象
+4. **处理 headers 大小写不敏感**：在编译时处理
+5. **验证 response schema 格式**：检查 status code 格式
+
+##### 4.2 编译验证 Schema：compileSchemasForValidation
+
+`lib/validation.js:57-116` 中的 `compileSchemasForValidation` 函数：
+
+```javascript
+function compileSchemasForValidation (context, compile, isCustom) {
+  const { schema } = context
+  if (!schema) {
+    return
+  }
+
+  const { method, url } = context.config || {}
+
+  // 1. 编译 headers schema（特殊处理：大小写不敏感）
+  const headers = schema.headers
+  if (headers && (isCustom || Object.getPrototypeOf(headers) !== Object.prototype)) {
+    // 自定义 compiler（如 Joi、Typebox）
+    context[headersSchema] = compile({ schema: headers, method, url, httpPart: 'headers' })
+  } else if (headers) {
+    // 标准 AJV 编译器：处理 headers 大小写不敏感
+    const headersSchemaLowerCase = {}
+    Object.keys(headers).forEach(k => { headersSchemaLowerCase[k] = headers[k] })
+    if (headersSchemaLowerCase.required instanceof Array) {
+      headersSchemaLowerCase.required = headersSchemaLowerCase.required.map(h => h.toLowerCase())
+    }
+    if (headers.properties) {
+      headersSchemaLowerCase.properties = {}
+      Object.keys(headers.properties).forEach(k => {
+        headersSchemaLowerCase.properties[k.toLowerCase()] = headers.properties[k]
+      })
+    }
+    context[headersSchema] = compile({ schema: headersSchemaLowerCase, method, url, httpPart: 'headers' })
+  }
+
+  // 2. 编译 body schema
+  if (schema.body) {
+    const contentProperty = schema.body.content
+    if (contentProperty) {
+      // Content-Type 特定的 schema（如 multipart/form-data）
+      const contentTypeSchemas = {}
+      for (const contentType of Object.keys(contentProperty)) {
+        const contentSchema = contentProperty[contentType].schema
+        contentTypeSchemas[contentType] = compile({ schema: contentSchema, method, url, httpPart: 'body', contentType })
+      }
+      context[bodySchema] = contentTypeSchemas
+    } else {
+      // 标准 body schema
+      context[bodySchema] = compile({ schema: schema.body, method, url, httpPart: 'body' })
+    }
+  }
+
+  // 3. 编译 querystring schema
+  if (schema.querystring) {
+    context[querystringSchema] = compile({ schema: schema.querystring, method, url, httpPart: 'querystring' })
+  }
+
+  // 4. 编译 params schema
+  if (schema.params) {
+    context[paramsSchema] = compile({ schema: schema.params, method, url, httpPart: 'params' })
+  }
 }
 ```
 
-Schema 编译也是在 preReady 阶段完成的，编译结果存储在 Context 的 Symbol 属性中：
-- `kRequestCacheValidateFns`：缓存的验证函数
-- `kReplyCacheSerializeFns`：缓存的序列化函数
+**关键发现**：
+- 编译结果存储在 Context 的 **Symbol 属性**中：
+  - `context[kSchemaHeaders]`：headers 验证函数
+  - `context[kSchemaBody]`：body 验证函数（可能是对象，按 Content-Type 区分）
+  - `context[kSchemaQuerystring]`：querystring 验证函数
+  - `context[kSchemaParams]`：params 验证函数
+
+##### 4.3 编译序列化 Schema：compileSchemasForSerialization
+
+`lib/validation.js:18-55` 中的 `compileSchemasForSerialization` 函数：
+
+```javascript
+function compileSchemasForSerialization (context, compile) {
+  if (!context.schema || !context.schema.response) {
+    return
+  }
+  const { method, url } = context.config || {}
+  context[responseSchema] = Object.keys(context.schema.response)
+    .reduce(function (acc, statusCode) {
+      const schema = context.schema.response[statusCode]
+      statusCode = statusCode.toLowerCase()
+      
+      if (schema.content) {
+        // Content-Type 特定的 response schema
+        const contentTypesSchemas = {}
+        for (const mediaName of Object.keys(schema.content)) {
+          const contentSchema = schema.content[mediaName].schema
+          contentTypesSchemas[mediaName] = compile({
+            schema: contentSchema,
+            url,
+            method,
+            httpStatus: statusCode,
+            contentType: mediaName
+          })
+        }
+        acc[statusCode] = contentTypesSchemas
+      } else {
+        // 标准 response schema（按状态码）
+        acc[statusCode] = compile({
+          schema,
+          url,
+          method,
+          httpStatus: statusCode
+        })
+      }
+
+      return acc
+    }, {})
+}
+```
+
+**关键发现**：
+- 编译结果存储在 `context[kSchemaResponse]` 中
+- 结构是**按状态码索引**的对象：
+  ```javascript
+  context[kSchemaResponse] = {
+    '2xx': compiledFunction,
+    '4xx': { 'application/json': compiledFunction, 'text/plain': anotherFunction },
+    'default': compiledFunction
+  }
+  ```
+
+##### 4.4 编译函数的来源
+
+在 `lib/route.js` 中，编译函数的获取顺序：
+
+```javascript
+// 验证器：路由定义 > scope 的 SchemaController
+const validatorCompiler = opts.validatorCompiler || schemaController.getValidatorCompiler()
+
+// 序列化器：路由定义 > scope 的 SchemaController
+const serializerCompiler = opts.serializerCompiler || schemaController.getSerializerCompiler()
+```
+
+**SchemaController 的 compiler 向上追溯** (`lib/schema-controller.js:119-133`)：
+```javascript
+getValidatorCompiler () {
+  return this.validatorCompiler || (this.parent && this.parent.getValidatorCompiler())
+}
+
+getSerializerCompiler () {
+  return this.serializerCompiler || (this.parent && this.parent.getSerializerCompiler())
+}
+```
+
+这意味着：
+- 如果当前 scope 没有自定义 `setValidatorCompiler`，会向上追溯父 scope
+- 根 scope 使用默认的 `@fastify/ajv-compiler` 和 `@fastify/fast-json-stringify-compiler`
+
+##### 4.5 编译结果固化到 Context 的 Symbol 属性
+
+让我们查看 `lib/symbols.js` 中定义的 schema 相关 Symbol：
+
+```javascript
+const kSchemaHeaders = Symbol('fastify.schemaHeaders')
+const kSchemaParams = Symbol('fastify.schemaParams')
+const kSchemaQuerystring = Symbol('fastify.schemaQuerystring')
+const kSchemaBody = Symbol('fastify.schemaBody')
+const kSchemaResponse = Symbol('fastify.schemaResponse')
+```
+
+这些 Symbol 属性在编译后直接存储在 Context 中：
+
+| Symbol | 存储内容 | 来源 |
+|--------|----------|------|
+| `kSchemaHeaders` | headers 验证函数 | `compileSchemasForValidation` |
+| `kSchemaBody` | body 验证函数（或对象） | `compileSchemasForValidation` |
+| `kSchemaQuerystring` | querystring 验证函数 | `compileSchemasForValidation` |
+| `kSchemaParams` | params 验证函数 | `compileSchemasForValidation` |
+| `kSchemaResponse` | 按状态码的序列化函数 | `compileSchemasForSerialization` |
+
+**关键设计**：
+- 使用 Symbol 是为了**避免属性名冲突**
+- 这些属性**直接存储在 Context 实例上**，运行时访问非常快
+- **preReady 阶段之后不会再修改**，真正实现了"固化"
+
+##### 4.6 运行时如何使用编译后的 Schema
+
+**验证阶段** (`lib/validation.js:146-201`)：
+```javascript
+function validate (context, request, execution) {
+  // 按顺序验证 params → body → query → headers
+  // 从 Context 的 Symbol 属性读取编译好的验证函数
+  
+  if (runExecution || !execution.skipParams) {
+    const params = validateParam(context[paramsSchema], request, 'params')
+    if (params) { /* 返回错误 */ }
+  }
+  // ... body, query, headers 类似
+}
+```
+
+**序列化阶段** (`lib/schemas.js:145-202`)：
+```javascript
+function getSchemaSerializer (context, statusCode, contentType) {
+  const responseSchemaDef = context[kSchemaResponse]
+  if (!responseSchemaDef) {
+    return false
+  }
+  // 按状态码查找：精确匹配 → 通配符 (2xx) → default
+  if (responseSchemaDef[statusCode]) {
+    // 检查是否有 Content-Type 特定的 schema
+    // ...
+    return responseSchemaDef[statusCode]
+  }
+  const fallbackStatusCode = (statusCode + '')[0] + 'xx'  // 404 → '4xx'
+  if (responseSchemaDef[fallbackStatusCode]) { /* ... */ }
+  if (responseSchemaDef.default) { /* ... */ }
+  return false
+}
+```
+
+##### 4.7 Schema 编译固化完整流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              Schema 编译固化到 Context 的完整流程                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  preReady 阶段触发：                                                         │
+│  ─────────────────                                                          │
+│                                                                              │
+│  avvio.once('preReady', () => {                                             │
+│    // 1. 先 setup Compiler（如果需要）                                       │
+│    schemaController.setupValidator(this[kOptions])                          │
+│    schemaController.setupSerializer(this[kOptions])                         │
+│                                                                              │
+│    // 2. 编译 Schema 到 Context                                             │
+│    if (opts.schema) {                                                        │
+│      context.schema = normalizeSchema(context.schema, ...)                  │
+│      compileSchemasForValidation(context, compiler, isCustom)              │
+│      compileSchemasForSerialization(context, compiler)                      │
+│    }                                                                          │
+│  })                                                                           │
+│                                                                              │
+│  详细流程：                                                                   │
+│  ──────────                                                                   │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ 阶段 1: setupValidator / setupSerializer                             │  │
+│  │                                                                       │  │
+│  │ setupValidator(serverOptions):                                       │  │
+│  │   const isReady = this.validatorCompiler !== undefined               │  │
+│  │               && !this.addedSchemas                                  │  │
+│  │   if (isReady) return  // 不需要重新编译                             │  │
+│  │                                                                       │  │
+│  │   // 使用当前 schemaBucket 中的所有 schemas 重新编译                 │  │
+│  │   this.validatorCompiler =                                            │  │
+│  │     this.getValidatorBuilder()(                                       │  │
+│  │       this.schemaBucket.getSchemas(),  // 包含父 scope 的           │  │
+│  │       serverOptions.ajv                  // + 自己新增的             │  │
+│  │     )                                                                 │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                         │
+│                                    ▼                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ 阶段 2: compileSchemasForValidation                                  │  │
+│  │                                                                       │  │
+│  │ 编译 context.schema 中的：                                            │  │
+│  │   - schema.headers   → context[kSchemaHeaders]                       │  │
+│  │   - schema.body      → context[kSchemaBody]                          │  │
+│  │   - schema.querystring → context[kSchemaQuerystring]                 │  │
+│  │   - schema.params    → context[kSchemaParams]                        │  │
+│  │                                                                       │  │
+│  │ 每个都是编译后的函数，可直接调用验证                                   │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                         │
+│                                    ▼                                         │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ 阶段 3: compileSchemasForSerialization                               │  │
+│  │                                                                       │  │
+│  │ 编译 context.schema.response 中的：                                   │  │
+│  │   context[kSchemaResponse] = {                                        │  │
+│  │     '2xx': compiledFunction,                                          │  │
+│  │     '4xx': { 'application/json': compiledFunction },                  │  │
+│  │     'default': compiledFunction                                       │  │
+│  │   }                                                                    │  │
+│  │                                                                       │  │
+│  │ 运行时通过 getSchemaSerializer() 按状态码查找                        │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  运行时使用：                                                                 │
+│  ────────────                                                                 │
+│                                                                              │
+│  请求验证阶段（preValidation）：                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ validate(context, request)                                            │  │
+│  │   │                                                                    │  │
+│  │   ├── validateParam(context[kSchemaParams], request, 'params')      │  │
+│  │   ├── validateParam(context[kSchemaBody], request, 'body')          │  │
+│  │   ├── validateParam(context[kSchemaQuerystring], request, 'query')  │  │
+│  │   └── validateParam(context[kSchemaHeaders], request, 'headers')    │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  响应序列化阶段（preSerialization → onSend）：                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │ getSchemaSerializer(context, statusCode, contentType)                │  │
+│  │   │                                                                    │  │
+│  │   ├── 查找 context[kSchemaResponse][statusCode]                      │  │
+│  │   ├── 或查找 context[kSchemaResponse][statusCode[0] + 'xx']         │  │
+│  │   └── 或查找 context[kSchemaResponse]['default']                      │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### 4.8 Schema 编译固化的关键设计要点
+
+| 要点 | 说明 |
+|------|------|
+| **Symbol 属性存储** | 避免属性名冲突，内部属性不对外暴露 |
+| **预编译** | preReady 阶段完成编译，运行时无需动态编译 |
+| **按路由独立** | 每个路由的 Context 有独立的编译结果 |
+| **Compiler 可继承** | `getValidatorCompiler()` 向上追溯 parent |
+| **运行时零开销** | 直接调用编译好的函数，无需查找 scope |
+
+##### 4.9 为什么 Schema 需要独立编译？
+
+1. **Schema 按 scope 隔离**：每个 scope 的 `schemaBucket` 是独立的
+   - 父 scope 的 schema 会被复制到子 scope
+   - 子 scope 新增的 schema 不会影响父
+
+2. **Compiler 可以自定义**：每个 scope 可以通过 `setValidatorCompiler` 覆盖
+   - 根 scope：默认使用 AJV
+   - 子 scope：可以使用 Joi、Zod 等其他验证库
+
+3. **路由级别的自定义**：路由定义时可以指定 `validatorCompiler` 和 `serializerCompiler`
+   - 优先级：路由定义 > scope 的 SchemaController > 父 scope
+
+**这就是为什么每个路由的 schema 需要独立编译并固化到 Context**——不同的路由可能：
+- 属于不同的 scope（schema 定义不同）
+- 使用不同的 compiler（验证/序列化逻辑不同）
+- 有不同的 schema 定义（每个路由独立）
 
 ### 7.4 Context 与 Scope 的关系总结
 
