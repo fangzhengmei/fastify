@@ -1017,10 +1017,284 @@ class SchemaController {
 }
 ```
 
-**隔离方式**：
-- 通过 `bucket(parent.getSchemas())` 复制父 schema
-- 子 scope 添加的 schema 不会传播到父 scope
-- 但可以通过 `fastify-plugin` 打破隔离
+#### 6.2.1 SchemaController 的完整结构
+
+让我们深入分析 `lib/schema-controller.js` 中 `SchemaController` 类的完整结构：
+
+```javascript
+class SchemaController {
+  constructor (parent, options) {
+    this.opts = options || parent?.opts
+    this.addedSchemas = false  // 标记是否添加了新 schema
+
+    this.compilersFactory = this.opts.compilersFactory
+
+    if (parent) {
+      // 有父 scope：复制父 schemas，继承 compiler 配置
+      this.schemaBucket = this.opts.bucket(parent.getSchemas())  // 复制父 schema
+      this.validatorCompiler = parent.getValidatorCompiler()
+      this.serializerCompiler = parent.getSerializerCompiler()
+      this.isCustomValidatorCompiler = parent.isCustomValidatorCompiler
+      this.isCustomSerializerCompiler = parent.isCustomSerializerCompiler
+      this.parent = parent  // 保留父引用（用于向上追溯）
+    } else {
+      // 根 scope：创建新的 schema 存储
+      this.schemaBucket = this.opts.bucket()
+      this.isCustomValidatorCompiler = this.opts.isCustomValidatorCompiler || false
+      this.isCustomSerializerCompiler = this.opts.isCustomSerializerCompiler || false
+    }
+  }
+
+  // Bucket 接口 - 管理 schema 定义
+  add (schema) {
+    this.addedSchemas = true  // 标记有新 schema 添加
+    return this.schemaBucket.add(schema)
+  }
+
+  getSchema (schemaId) {
+    return this.schemaBucket.getSchema(schemaId)
+  }
+
+  getSchemas () {
+    return this.schemaBucket.getSchemas()
+  }
+
+  // Compiler 管理 - 用于编译 schema 为验证/序列化函数
+  setValidatorCompiler (validatorCompiler) {
+    this.compilersFactory = Object.assign(
+      {},
+      this.compilersFactory,
+      { buildValidator: () => validatorCompiler })
+    this.validatorCompiler = validatorCompiler
+    this.isCustomValidatorCompiler = true
+  }
+
+  setSerializerCompiler (serializerCompiler) {
+    this.compilersFactory = Object.assign(
+      {},
+      this.compilersFactory,
+      { buildSerializer: () => serializerCompiler })
+    this.serializerCompiler = serializerCompiler
+    this.isCustomSerializerCompiler = true
+  }
+
+  // 向上追溯获取 compiler（关键！）
+  getValidatorCompiler () {
+    return this.validatorCompiler || (this.parent && this.parent.getValidatorCompiler())
+  }
+
+  getSerializerCompiler () {
+    return this.serializerCompiler || (this.parent && this.parent.getSerializerCompiler())
+  }
+
+  getSerializerBuilder () {
+    return this.compilersFactory.buildSerializer || (this.parent && this.parent.getSerializerBuilder())
+  }
+
+  getValidatorBuilder () {
+    return this.compilersFactory.buildValidator || (this.parent && this.parent.getValidatorBuilder())
+  }
+
+  // 在 preReady 阶段调用 - 实际编译
+  setupValidator (serverOptions) {
+    const isReady = this.validatorCompiler !== undefined && !this.addedSchemas
+    if (isReady) {
+      return
+    }
+    // 使用当前 schemaBucket 中的所有 schemas 来编译 validator
+    this.validatorCompiler = this.getValidatorBuilder()(this.schemaBucket.getSchemas(), serverOptions.ajv)
+  }
+
+  setupSerializer (serverOptions) {
+    const isReady = this.serializerCompiler !== undefined && !this.addedSchemas
+    if (isReady) {
+      return
+    }
+    this.serializerCompiler = this.getSerializerBuilder()(this.schemaBucket.getSchemas(), serverOptions.serializerOpts)
+  }
+}
+```
+
+#### 6.2.2 SchemaController 的隔离与继承机制
+
+SchemaController 的设计体现了**隔离与继承的平衡**：
+
+##### 1. Schema 定义的隔离（schemaBucket）
+
+**隔离机制**：
+- 每个 scope 的 `schemaBucket` 是**独立的 `Schemas` 实例**
+- 创建时通过 `bucket(parent.getSchemas())` **复制父 scope 的 schemas**
+- 子 scope 通过 `addSchema()` 添加的新 schema 只会添加到自己的 `schemaBucket`
+- 父 scope 无法看到子 scope 新增的 schema
+
+**源码证据** (`lib/plugin-override.js:67`)：
+```javascript
+instance[kSchemaController] = SchemaController.buildSchemaController(old[kSchemaController])
+```
+
+当创建新的封装实例时，会调用 `buildSchemaController(parentSchemaCtrl)`：
+
+```javascript
+// lib/schema-controller.js:11-38
+function buildSchemaController (parentSchemaCtrl, opts) {
+  if (parentSchemaCtrl) {
+    return new SchemaController(parentSchemaCtrl, opts)  // 有父
+  }
+  // ... 根实例创建
+}
+```
+
+**示例**：
+```javascript
+const fastify = Fastify()
+
+// Root scope 添加 schema
+fastify.addSchema({ $id: 'rootSchema', type: 'object' })
+
+fastify.register(function childPlugin (instance, opts, done) {
+  // 此时 child scope 的 schemaBucket:
+  // - 包含 rootSchema（复制自父）
+  // - 独立的存储
+  
+  instance.addSchema({ $id: 'childSchema', type: 'object' })
+  
+  // childSchema 只在 child scope 可见
+  console.log(instance.getSchema('childSchema'))  // 存在
+  console.log(fastify.getSchema('childSchema'))   // undefined（隔离）
+  
+  done()
+})
+```
+
+##### 2. Compiler 的继承机制
+
+与 schema 定义的**隔离**不同，compiler 是**可继承**的：
+
+**继承机制**：
+- `getValidatorCompiler()` 会**向上追溯 parent**：
+  ```javascript
+  getValidatorCompiler () {
+    return this.validatorCompiler || (this.parent && this.parent.getValidatorCompiler())
+  }
+  ```
+- 如果当前 scope 没有自己设置 `validatorCompiler`，则使用父 scope 的
+- 这允许子 scope 共享父 scope 的自定义 compiler
+
+**setupValidator/setupSerializer 的调用时机**：
+- 在 **preReady 阶段**调用
+- 用于根据当前 `schemaBucket` 中的所有 schemas 重新编译
+- 只有当 `addedSchemas === true`（添加了新 schema）时才会重新编译
+
+**测试用例验证** (`test/schema-feature.test.js:1669-1754`)：
+```javascript
+test('setSchemaController: Inherits correctly parent schemas with a customized validator instance', async t => {
+  const server = Fastify()
+  server.addSchema({ $id: 'some', type: 'array', items: { type: 'string' } })
+  server.addSchema({ $id: 'error_response', type: 'object', ... })
+
+  server.register((instance, _, done) => {
+    instance.setSchemaController({
+      compilersFactory: {
+        buildValidator: function (externalSchemas) {
+          // externalSchemas 包含父 scope 的 schemas！
+          const schemaKeys = Object.keys(externalSchemas)
+          t.assert.strictEqual(schemaKeys.length, 2, 'Contains same number of schemas')
+          t.assert.deepStrictEqual([someSchema, errorResponseSchema], Object.values(externalSchemas))
+          // ...
+        }
+      }
+    })
+
+    instance.get('/', {
+      schema: {
+        querystring: {
+          type: 'object',
+          properties: {
+            msg: { $ref: 'some#' }  // 引用父 scope 的 schema
+          }
+        }
+      }
+    }, (req, reply) => { reply.send({ noop: 'noop' }) })
+
+    done()
+  })
+})
+```
+
+#### 6.2.3 SchemaController 与 Scope 的关系
+
+| 维度 | 隔离 | 继承 | 说明 |
+|------|------|------|------|
+| **schemaBucket（schema 定义）** | ✅ 是 | ✅ 创建时复制 | 每个 scope 独立存储，创建时复制父 |
+| **validatorCompiler** | ✅ 可覆盖 | ✅ 向上追溯 | `getValidatorCompiler()` 会找 parent |
+| **serializerCompiler** | ✅ 可覆盖 | ✅ 向上追溯 | `getSerializerCompiler()` 会找 parent |
+| **compilersFactory** | ✅ 可覆盖 | ✅ 继承 opts | 通过 `parent?.opts` 继承 |
+
+#### 6.2.4 fastify-plugin 对 SchemaController 的影响
+
+| 场景 | 普通插件 | fastify-plugin |
+|------|----------|----------------|
+| **kSchemaController** | 新创建的 `SchemaController` 实例 | 共享父 scope 的 `SchemaController` |
+| **schemaBucket** | 复制父 schemas，独立存储 | 直接使用父的 schemaBucket |
+| **addSchema 影响** | 只在子 scope 可见 | 对父 scope 也可见 |
+| **validatorCompiler** | 可继承，可覆盖 | 直接使用父的 |
+
+**关键差异**：
+- 普通插件：`override` 函数创建新的 `SchemaController` 实例
+- fastify-plugin：`override` 函数直接返回 `old`，共享父的 `kSchemaController`
+
+#### 6.2.5 Schema 隔离流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    SchemaController 在 Scope 树中的隔离与继承                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  插件注册时（override 函数）：                                               │
+│  ─────────────────────────────                                               │
+│                                                                              │
+│  检查 skip-override:                                                         │
+│  ┌─────────────────┐                     ┌─────────────────┐               │
+│  │ skip-override   │                     │ skip-override   │               │
+│  │ === false       │                     │ === true        │               │
+│  └────────┬────────┘                     └────────┬────────┘               │
+│           │                                        │                        │
+│           ▼                                        ▼                        │
+│  ┌─────────────────────────────┐      ┌─────────────────────────────┐    │
+│  │ 创建新的 SchemaController    │      │ 直接使用父的 SchemaController │    │
+│  │                             │      │                             │    │
+│  │ this.schemaBucket =         │      │ 共享父的 schemaBucket        │    │
+│  │   bucket(parent.getSchemas())│      │ addSchema 对父也可见        │    │
+│  │                             │      │                             │    │
+│  │ 复制父的 schemas 定义        │      │ validatorCompiler 直接继承   │    │
+│  │ 但子 scope 新增的 schema     │      │ serializerCompiler 直接继承  │    │
+│  │ 不会传播到父                 │      │                             │    │
+│  └─────────────────────────────┘      └─────────────────────────────┘    │
+│                                                                              │
+│  Compiler 继承（getValidatorCompiler）：                                    │
+│  ─────────────────────────────────────────────────────────                  │
+│                                                                              │
+│  childSchemaController.getValidatorCompiler():                             │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌─────────────────────────────────────────┐                                │
+│  │ this.validatorCompiler ||                │                                │
+│  │ (this.parent && this.parent.getValidatorCompiler()) │                    │
+│  └───────────────┬─────────────────────────┘                                │
+│                  │                                                            │
+│        ┌─────────┴─────────┐                                                  │
+│        ▼                   ▼                                                  │
+│  ┌────────────┐    ┌────────────┐                                            │
+│  │ 有自己的    │    │ 向上追溯    │                                            │
+│  │ compiler   │    │ parent     │                                            │
+│  └────────────┘    └────────────┘                                            │
+│                                                                              │
+│  这意味着：                                                                   │
+│  - 子 scope 可以共享父 scope 的自定义 compiler                              │
+│  - 子 scope 可以通过 setValidatorCompiler 覆盖                               │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ### 6.3 路由前缀隔离
 
