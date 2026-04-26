@@ -454,13 +454,92 @@ fastify.ready(() => {
 
 ## 6. 其他被隔离的组件
 
-### 6.1 Hooks 隔离
+### 6.1 Hooks 隔离与传播机制（深度分析）
 
-`lib/hooks.js:73-90` 中的 `buildHooks` 函数：
+Hooks 系统是 Fastify 中最复杂的隔离机制之一，它有自己独特的传播规则。让我们深入分析。
+
+#### 6.1.1 Hooks 的分类
+
+`lib/hooks.js:3-22` 定义了两类 hooks：
+
+```javascript
+const applicationHooks = [
+  'onRoute',
+  'onRegister',
+  'onReady',
+  'onListen',
+  'preClose',
+  'onClose'
+]
+const lifecycleHooks = [
+  'onTimeout',
+  'onRequest',
+  'preParsing',
+  'preValidation',
+  'preSerialization',
+  'preHandler',
+  'onSend',
+  'onResponse',
+  'onError',
+  'onRequestAbort'
+]
+```
+
+| 类型 | 包含的 Hooks | 特点 |
+|------|-------------|------|
+| **应用 Hooks** | `onRoute`, `onRegister`, `onReady`, `onListen`, `preClose`, `onClose` | 与插件生命周期相关 |
+| **生命周期 Hooks** | `onRequest`, `preParsing`, `preValidation`, `preHandler`, `onSend`, `onResponse`, `onError` 等 | 与 HTTP 请求/响应生命周期相关 |
+
+#### 6.1.2 addHook 的两种行为
+
+`fastify.js:568-614` 中的 `addHook` 函数是理解 hooks 传播的关键：
+
+```javascript
+function addHook (name, fn) {
+  throwIfAlreadyStarted('Cannot call "addHook"!')
+
+  // ... 参数验证 ...
+
+  if (name === 'onClose') {
+    this.onClose(fn.bind(this))
+  } else if (name === 'onReady' || name === 'onListen' || name === 'onRoute') {
+    // 行为 1: 直接添加到当前实例，不传播
+    this[kHooks].add(name, fn)
+  } else {
+    // 行为 2: 通过 _addHook 递归传播到所有子 scope
+    this.after((err, done) => {
+      try {
+        _addHook.call(this, name, fn)
+        done(err)
+      } catch (err) {
+        done(err)
+      }
+    })
+  }
+  return this
+
+  function _addHook (name, fn) {
+    this[kHooks].add(name, fn)
+    // 关键：递归传播到所有子实例
+    this[kChildren].forEach(child => _addHook.call(child, name, fn))
+  }
+}
+```
+
+**关键发现**：
+
+1. **`onReady`, `onListen`, `onRoute`**：直接添加到当前实例的 `kHooks`，**不传播**到子 scope
+2. **其他所有 hooks**（生命周期 hooks）：通过 `_addHook` 函数**递归传播**到当前实例和所有已存在的子实例
+3. **`_addHook` 的递归机制**：不仅添加到 `this[kHooks]`，还会遍历 `this[kChildren]` 并递归调用
+
+#### 6.1.3 buildHooks 的继承规则
+
+`lib/hooks.js:73-90` 中的 `buildHooks` 函数在创建新封装实例时被调用：
 
 ```javascript
 function buildHooks (h) {
   const hooks = new Hooks()
+  // 生命周期 hooks：通过 .slice() 浅拷贝父实例的 hooks
   hooks.onRequest = h.onRequest.slice()
   hooks.preParsing = h.preParsing.slice()
   hooks.preValidation = h.preValidation.slice()
@@ -473,6 +552,7 @@ function buildHooks (h) {
   hooks.onRegister = h.onRegister.slice()
   hooks.onTimeout = h.onTimeout.slice()
   hooks.onRequestAbort = h.onRequestAbort.slice()
+  // 应用 hooks：不继承，每个 scope 独立
   hooks.onReady = []
   hooks.onListen = []
   hooks.preClose = []
@@ -480,10 +560,433 @@ function buildHooks (h) {
 }
 ```
 
-**隔离方式**：
-- 生命周期 hooks 通过 `.slice()` 复制（浅拷贝）
-- `onReady`、`onListen`、`preClose` 不继承，每个 scope 独立
-- 子 scope 添加的 hooks 不会影响父 scope
+**继承规则**：
+
+| Hook 类型 | 继承方式 | 说明 |
+|-----------|----------|------|
+| 生命周期 hooks | `slice()` 浅拷贝 | 新实例继承父实例已有的 hooks |
+| `onRoute`, `onRegister` | `slice()` 浅拷贝 | 这两个应用 hooks 也会被继承 |
+| `onReady`, `onListen`, `preClose` | 初始化为空数组 `[]` | **不继承**，每个 scope 完全独立 |
+
+#### 6.1.4 Hooks 的双重传播机制
+
+结合 `addHook` 和 `buildHooks`，hooks 实际上有**双重传播保障**：
+
+**机制 1：创建时继承（buildHooks）**
+- 当创建新的子 scope 时，通过 `buildHooks` 复制父实例已有的生命周期 hooks
+- 这确保了子 scope 能继承注册时父实例已有的 hooks
+
+**机制 2：运行时传播（_addHook）**
+- 当父实例后续添加新的生命周期 hooks 时，通过 `_addHook` 递归传播到已存在的子实例
+- 这确保了后续添加的 hooks 也能到达已创建的子 scope
+
+**流程图**：
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Hooks 双重传播机制                                │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  时机 1: 创建新 scope 时（buildHooks）                              │
+│  ┌─────────────┐                                                    │
+│  │  父实例     │  已有 hooks: [hook1, hook2]                       │
+│  │  kHooks     │                                                    │
+│  └──────┬──────┘                                                    │
+│         │                                                           │
+│         ▼ Object.create + buildHooks                                │
+│  ┌─────────────┐                                                    │
+│  │  子实例     │  kHooks = {                                        │
+│  │  kHooks     │    onRequest: [hook1, hook2].slice()  // 复制   │
+│  └─────────────┘    ...                                            │
+│                  }                                                  │
+│                                                                      │
+│  时机 2: 父实例后续添加 hooks 时（_addHook）                        │
+│  ┌─────────────┐                                                    │
+│  │  父实例     │  addHook('onRequest', hook3)                      │
+│  │             │                                                    │
+│  │  _addHook:  │  1. this[kHooks].add(name, fn)  // 添加到自己   │
+│  │             │  2. 遍历 kChildren，递归调用 _addHook             │
+│  └──────┬──────┘                                                    │
+│         │                                                           │
+│         ▼ 递归传播                                                  │
+│  ┌─────────────┐                                                    │
+│  │  子实例     │  也收到 hook3                                      │
+│  │  kHooks     │                                                    │
+│  └─────────────┘                                                    │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 6.1.5 路由注册时 hooks 的收集与合并
+
+当路由注册时，在 `preReady` 阶段会收集和合并 hooks。`lib/route.js:394-400`：
+
+```javascript
+avvio.once('preReady', () => {
+  for (const hook of lifecycleHooks) {
+    const toSet = this[kHooks][hook]
+      .concat(opts[hook] || [])  // 合并路由级别的 hooks
+      .map(h => h.bind(this))     // 绑定到当前实例
+    context[hook] = toSet.length ? toSet : null
+  }
+  // ...
+})
+```
+
+**关键流程**：
+
+1. **收集时机**：在 `avvio.once('preReady')` 回调中执行
+2. **合并来源**：
+   - `this[kHooks][hook]`：当前 scope 实例级别的 hooks
+   - `opts[hook]`：路由定义时指定的路由级 hooks
+3. **绑定上下文**：所有 hooks 通过 `.bind(this)` 绑定到当前 Fastify 实例
+4. **存储位置**：合并后的 hooks 存储在 `context[hook]` 中
+
+**Context 与 hooks 的关系**：
+
+每个路由都有一个独立的 `Context` 对象（`lib/context.js`），它存储了该路由执行时需要的所有 hooks：
+
+```javascript
+// Context 构造函数中引用的 hooks 相关属性
+function Context ({
+  // ...
+  onRequest,     // 来自 context[hook] 的赋值
+  onSend,        // 来自 context[hook] 的赋值
+  onError,       // 来自 context[hook] 的赋值
+  onTimeout,     // 来自 context[hook] 的赋值
+  preHandler,    // 来自 context[hook] 的赋值
+  preParsing,    // 来自 context[hook] 的赋值
+  preValidation, // 来自 context[hook] 的赋值
+  preSerialization, // 来自 context[hook] 的赋值
+  onResponse,    // 来自 context[hook] 的赋值
+  onRequestAbort // 来自 context[hook] 的赋值
+  // ...
+})
+```
+
+这意味着：**每个路由的 hooks 在 `preReady` 阶段就已经确定并固化在 Context 中**，后续的修改不会影响已注册的路由。
+
+#### 6.1.6 Skip-Override 对 Hooks 的影响
+
+现在让我们分析 `skip-override` 标记如何影响 hooks 的注册目标和传播。
+
+**场景对比**：
+
+```javascript
+const fastify = Fastify()
+const fp = require('fastify-plugin')
+
+// 场景 A: 普通插件（无 skip-override）
+fastify.register(function normalPlugin (instance, opts, done) {
+  // 1. override 函数创建了新的封装实例
+  // 2. instance 是新创建的子实例
+  // 3. addHook 会调用 _addHook，传播到 instance 的子 scope
+  // 4. 但不会传播到 fastify（父实例）
+  instance.addHook('onRequest', (req, reply, done) => {
+    console.log('normalPlugin onRequest')
+    done()
+  })
+  done()
+})
+
+// 场景 B: 使用 fastify-plugin（有 skip-override）
+fastify.register(fp(function sharedPlugin (instance, opts, done) {
+  // 1. override 函数直接返回 old（fastify 实例）
+  // 2. instance === fastify
+  // 3. addHook 会调用 _addHook，传播到 fastify 的所有子 scope
+  instance.addHook('onRequest', (req, reply, done) => {
+    console.log('sharedPlugin onRequest')
+    done()
+  })
+  done()
+}))
+```
+
+**核心差异分析**：
+
+| 维度 | 普通插件（无 skip-override） | fastify-plugin（有 skip-override） |
+|------|------------------------------|------------------------------------|
+| **注册目标** | 新创建的子实例 `instance` | 父实例 `old`（直接是 fastify 或上层实例） |
+| **Hook 传播范围** | 只传播到 `instance` 的子 scope | 传播到 `old` 的所有子 scope（即整个插件树） |
+| **父实例可见性** | 父实例（如 fastify）的 `kHooks` 不会包含这个 hook | 父实例的 `kHooks` 直接包含这个 hook |
+| **对已有路由的影响** | 不影响父实例已注册路由的 Context | 会影响父实例已注册路由吗？**答案：不会** |
+
+**关键问题：为什么不会影响已有路由？**
+
+答案在 `lib/route.js:394-400` 的 `preReady` 阶段：
+
+```javascript
+avvio.once('preReady', () => {
+  // hooks 在此时被收集并固化到 Context 中
+  for (const hook of lifecycleHooks) {
+    const toSet = this[kHooks][hook].concat(opts[hook] || [])
+    context[hook] = toSet.length ? toSet : null
+  }
+})
+```
+
+**时间线分析**：
+
+```
+时间点 1: fastify.register(plugin) 调用
+         → override 函数执行
+         → 插件函数执行
+         → 插件中的 addHook 执行（添加到 kHooks）
+
+时间点 2: avvio 内部处理，等待所有插件注册完成
+
+时间点 3: preReady 事件触发
+         → 所有路由的 hooks 被收集到 Context 中
+         → 此时 kHooks 中的所有 hooks 都会被包含
+
+时间点 4: ready 事件触发
+         → 服务器可以开始接收请求
+```
+
+**所以**：
+- 如果插件使用 `skip-override`，并且在 `preReady` 之前注册，它的 hooks 会被包含在父实例所有路由的 Context 中
+- 这就是为什么 `test/404s.test.js` 中的测试能通过：
+
+```javascript
+// 来自 test/404s.test.js:661-703
+test('run non-encapsulated plugin hooks on default 404', (t, done) => {
+  const fastify = Fastify()
+
+  fastify.register(fp(function (instance, options, done) {
+    instance.addHook('onRequest', function (req, res, done) {
+      t.assert.ok(true, 'onRequest called')  // 这个 hook 会在 404 时触发
+      done()
+    })
+    // ... 其他 hooks
+    done()
+  }))
+
+  fastify.get('/', function (req, reply) {
+    reply.send({ hello: 'world' })
+  })
+
+  // 访问不存在的路由（404）也会触发 fp 插件的 hooks
+  fastify.inject({ method: 'POST', url: '/', payload: { hello: 'world' } }, ...)
+})
+```
+
+**原因**：`fp` 插件的 `addHook` 直接在 `fastify` 实例上执行，当 `preReady` 触发时，这些 hooks 已经在 `fastify[kHooks]` 中，会被收集到所有路由（包括 404 路由）的 Context 中。
+
+#### 6.1.7 测试用例验证
+
+让我们通过 `test/hooks.test.js:169-200` 的测试来验证隔离性：
+
+```javascript
+test('onRequest hook should support encapsulation / 1', (t, testDone) => {
+  t.plan(5)
+  const fastify = Fastify()
+
+  fastify.register((instance, opts, done) => {
+    // 子插件添加的 hook
+    instance.addHook('onRequest', (req, reply, done) => {
+      t.assert.strictEqual(req.raw.url, '/plugin')  // 只在 /plugin 路由触发
+      done()
+    })
+
+    instance.get('/plugin', (request, reply) => {
+      reply.send()
+    })
+
+    done()
+  })
+
+  fastify.get('/root', (request, reply) => {
+    reply.send()
+  })
+
+  // 访问 /root：不会触发子插件的 hook
+  fastify.inject('/root', (err, res) => {
+    t.assert.ifError(err)
+    t.assert.strictEqual(res.statusCode, 200)
+
+    // 访问 /plugin：会触发子插件的 hook
+    fastify.inject('/plugin', (err, res) => {
+      t.assert.ifError(err)
+      t.assert.strictEqual(res.statusCode, 200)
+      testDone()
+    })
+  })
+})
+```
+
+**验证结果**：
+- 子插件中添加的 `onRequest` hook **只在子插件的路由**（`/plugin`）上触发
+- 父实例的路由（`/root`）**不会触发**子插件的 hook
+- 这证明了 hooks 的隔离性：子 scope 的 hooks 不会向上传播
+
+再看 `test/plugin.3.test.js:22-65` 中 `fastify-plugin` 的行为：
+
+```javascript
+test('add hooks after route declaration', async t => {
+  t.plan(2)
+  const fastify = Fastify()
+
+  function plugin (instance, opts, done) {
+    instance.decorateRequest('check', null)
+    // 使用 fp 包装，这个 hook 会传播到所有子 scope
+    instance.addHook('onRequest', (req, reply, done) => {
+      req.check = {}
+      done()
+    })
+    setImmediate(done)
+  }
+  fastify.register(fp(plugin))  // 注意：使用了 fp
+
+  fastify.register((instance, options, done) => {
+    // 这个子插件的路由会触发 fp 插件的 onRequest hook
+    instance.addHook('preHandler', function b (req, res, done) {
+      req.check.hook2 = true  // req.check 已经被 fp 插件的 hook 初始化
+      done()
+    })
+
+    instance.get('/', (req, reply) => {
+      reply.send(req.check)  // 返回 { hook1: true, hook2: true, hook3: true }
+    })
+    // ...
+    done()
+  })
+
+  // 根实例也添加 preHandler
+  fastify.addHook('preHandler', function a (req, res, done) {
+    req.check.hook1 = true
+    done()
+  })
+
+  // 最终结果：所有 hooks 都被触发
+  // req.check = { hook1: true, hook2: true, hook3: true }
+})
+```
+
+**验证结果**：
+- 使用 `fp` 包装的插件添加的 `onRequest` hook 会传播到所有子 scope
+- 根实例添加的 `preHandler` hook 也会传播到子 scope
+- 子插件的路由能访问所有这些 hooks
+
+#### 6.1.8 Hooks 传播规则总结表
+
+| Hook 类型 | 父→子（创建时） | 父→子（运行时） | 子→父 | 受 skip-override 影响 |
+|-----------|-----------------|-----------------|-------|----------------------|
+| `onRequest` | ✅ `slice()` 复制 | ✅ `_addHook` 递归 | ❌ 否 | ✅ 是 |
+| `preParsing` | ✅ `slice()` 复制 | ✅ `_addHook` 递归 | ❌ 否 | ✅ 是 |
+| `preValidation` | ✅ `slice()` 复制 | ✅ `_addHook` 递归 | ❌ 否 | ✅ 是 |
+| `preHandler` | ✅ `slice()` 复制 | ✅ `_addHook` 递归 | ❌ 否 | ✅ 是 |
+| `preSerialization` | ✅ `slice()` 复制 | ✅ `_addHook` 递归 | ❌ 否 | ✅ 是 |
+| `onSend` | ✅ `slice()` 复制 | ✅ `_addHook` 递归 | ❌ 否 | ✅ 是 |
+| `onResponse` | ✅ `slice()` 复制 | ✅ `_addHook` 递归 | ❌ 否 | ✅ 是 |
+| `onError` | ✅ `slice()` 复制 | ✅ `_addHook` 递归 | ❌ 否 | ✅ 是 |
+| `onTimeout` | ✅ `slice()` 复制 | ✅ `_addHook` 递归 | ❌ 否 | ✅ 是 |
+| `onRequestAbort` | ✅ `slice()` 复制 | ✅ `_addHook` 递归 | ❌ 否 | ✅ 是 |
+| `onRoute` | ✅ `slice()` 复制 | ❌ 直接添加，不递归 | ❌ 否 | ✅ 是 |
+| `onRegister` | ✅ `slice()` 复制 | ❌ 直接添加，不递归 | ❌ 否 | ✅ 是 |
+| `onReady` | ❌ 初始化为 `[]` | ❌ 直接添加，不递归 | ❌ 否 | ✅ 是（但不继承） |
+| `onListen` | ❌ 初始化为 `[]` | ❌ 直接添加，不递归 | ❌ 否 | ✅ 是（但不继承） |
+| `preClose` | ❌ 初始化为 `[]` | ❌ 直接添加，不递归 | ❌ 否 | ✅ 是（但不继承） |
+
+#### 6.1.9 Hooks 完整传播流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Hooks 在 Scope 树中的完整传播流程                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  阶段 1: 插件注册与 Scope 创建                                               │
+│  ─────────────────────────────                                               │
+│                                                                              │
+│  fastify.register(plugin)                                                    │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  override(old, fn, opts) 函数                                        │   │
+│  │                                                                       │   │
+│  │  检查 skip-override:                                                  │   │
+│  │  ┌─────────────────┐         ┌─────────────────┐                     │   │
+│  │  │ skip-override   │         │ skip-override   │                     │   │
+│  │  │ === false       │         │ === true        │                     │   │
+│  │  └────────┬────────┘         └────────┬────────┘                     │   │
+│  │           │                            │                              │   │
+│  │           ▼                            ▼                              │   │
+│  │  ┌─────────────────┐         ┌─────────────────┐                     │   │
+│  │  │ 创建新的封装    │         │ 直接返回 old    │                     │   │
+│  │  │ 实例 instance   │         │ (不创建新实例)  │                     │   │
+│  │  │                 │         │                 │                     │   │
+│  │  │ instance.kHooks │         │ 插件中的        │                     │   │
+│  │  │ = buildHooks(  │         │ addHook 直接在  │                     │   │
+│  │  │   old.kHooks)  │         │ old 上执行      │                     │   │
+│  │  │                 │         │                 │                     │   │
+│  │  │ 生命周期 hooks  │         │                 │                     │   │
+│  │  │ 通过 slice()    │         │                 │                     │   │
+│  │  │ 复制父实例的    │         │                 │                     │   │
+│  │  │ hooks           │         │                 │                     │   │
+│  │  └─────────────────┘         └─────────────────┘                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  阶段 2: 插件执行与 addHook 调用                                            │
+│  ────────────────────────────────                                           │
+│                                                                              │
+│  插件函数执行：instance.addHook(name, fn)                                   │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  addHook(name, fn) 函数                                              │   │
+│  │                                                                       │   │
+│  │  判断 hook 类型:                                                      │   │
+│  │  ┌─────────────────────────────┐    ┌─────────────────────────┐   │   │
+│  │  │ onReady / onListen / onRoute│    │ 其他 hooks（生命周期等）│   │   │
+│  │  └──────────────┬──────────────┘    └───────────┬─────────────┘   │   │
+│  │                 │                                 │                  │   │
+│  │                 ▼                                 ▼                  │   │
+│  │  ┌─────────────────────────┐    ┌─────────────────────────────┐   │   │
+│  │  │ 直接添加到              │    │ 通过 this.after 延迟执行    │   │   │
+│  │  │ this[kHooks].add()     │    │                             │   │   │
+│  │  │                         │    │ _addHook 函数:             │   │   │
+│  │  │ ❌ 不传播到子 scope     │    │                             │   │   │
+│  │  │                         │    │ 1. this[kHooks].add(name,fn)│   │   │
+│  │  │                         │    │ 2. 递归遍历 kChildren       │   │   │
+│  │  │                         │    │    并调用 _addHook          │   │   │
+│  │  │                         │    │                             │   │   │
+│  │  │                         │    │ ✅ 传播到所有已存在的子 scope│   │   │
+│  │  └─────────────────────────┘    └─────────────────────────────┘   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  阶段 3: preReady 阶段 - Hooks 固化到路由 Context                          │
+│  ───────────────────────────────────────────────────────                   │
+│                                                                              │
+│  avvio.once('preReady', () => {                                             │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  对每个已注册的路由:                                                 │   │
+│  │                                                                       │   │
+│  │  for (const hook of lifecycleHooks) {                                │   │
+│  │    // 合并实例级别 hooks 和路由级别 hooks                            │   │
+│  │    const toSet = this[kHooks][hook]                                  │   │
+│  │      .concat(opts[hook] || [])                                       │   │
+│  │      .map(h => h.bind(this))                                          │   │
+│  │                                                                       │   │
+│  │    // 固化到 Context，以后不会再改变                                 │   │
+│  │    context[hook] = toSet.length ? toSet : null                      │   │
+│  │  }                                                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  关键点:                                                                     │
+│  - 此时点之后添加的 hooks 不会影响已注册的路由                             │
+│  - 每个路由有独立的 Context，包含它执行时需要的所有 hooks                   │
+│                                                                              │
+│  阶段 4: 请求处理 - 从 Context 读取 Hooks                                   │
+│  ────────────────────────────────────────────                               │
+│                                                                              │
+│  请求到达时:                                                                 │
+│  1. find-my-way 路由匹配，找到对应的 Context                                │
+│  2. 按顺序执行 Context 中的 hooks:                                          │
+│     onRequest → preParsing → preValidation → preHandler → handler         │
+│                → preSerialization → onSend → onResponse                    │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ### 6.2 Schema 隔离
 
